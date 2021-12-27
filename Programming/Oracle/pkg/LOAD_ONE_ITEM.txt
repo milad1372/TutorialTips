@@ -1,0 +1,171 @@
+CREATE OR REPLACE PACKAGE BODY P_TORKANPOUR.PKG_ETL_UNL_FILES
+AS
+   g_extTableName varchar2(256);
+   g_fileType         varchar2(256);
+   g_fileName         varchar2(256);
+   g_fileID         number;
+   g_insertStmt    clob;
+   PROCEDURE LOAD_ONE_ITEM (p_loadItemID VARCHAR2)
+   AS
+   BEGIN
+        SELECT file_type INTO g_fileType
+          FROM dwc_input_file
+               WHERE load_item_cd = p_loadItemID
+              GROUP BY file_type;
+      
+        DBMS_OUTPUT.PUT_LINE('-start load item ' || p_loadItemID);
+
+      g_extTableName := upper('ext$_' || g_fileType || '_' || p_loadItemID);
+      
+      CREATE_EXT_TAB;
+      BUILD_INSERT_STMT;
+      
+      FOR file_row 
+          IN (SELECT file_name, id
+               FROM dwc_input_file
+              WHERE load_item_cd = p_loadItemID AND status = 'READY2LOAD' order by id)
+      LOOP
+          g_fileId := file_row.id;
+         g_fileName := file_row.file_name;
+         DBMS_OUTPUT.PUT_LINE('filename=' || g_fileName || ' type=' || g_fileType);
+       
+         DBMS_OUTPUT.PUT_LINE('changing status to ALTER_EXT');
+         UPDATE_STATUS ('ALTER_EXT', NULL, NULL);
+            
+         DBMS_OUTPUT.PUT_LINE('altering table');
+         ALTER_EXT_TAB;  
+          
+         DBMS_OUTPUT.PUT_LINE('changing status to LOADING');
+         UPDATE_STATUS ('LOADING', NULL, NULL);
+                   
+         DBMS_OUTPUT.PUT_LINE('start load from external table');
+         LOAD_FROM_EXT_TAB;
+         
+      END LOOP;
+        DBMS_OUTPUT.PUT_LINE('-end load item ' || p_loadItemID);
+        
+        
+       execute immediate 'drop table ' || g_extTableName;
+      
+      
+    EXCEPTION
+          WHEN OTHERS THEN
+          DBMS_OUTPUT.PUT_LINE('***load item error');
+          DBMS_OUTPUT.PUT_LINE(SQLERRM);
+          --LOAD_ITEM_CLEANUP (p_loadItemID);
+          RAISE_APPLICATION_ERROR(-20001, SQLERRM);
+   END;
+
+   PROCEDURE LOAD_FROM_EXT_TAB
+   AS
+      l_rowCount    NUMBER;
+   BEGIN
+
+      EXECUTE IMMEDIATE g_insertStmt USING g_fileID;
+
+      l_rowCount := SQL%ROWCOUNT;
+      
+      UPDATE_STATUS ('LOADED', l_rowCount, NULL);
+
+      COMMIT;
+
+      DBMS_OUTPUT.PUT_LINE ('inserted=' || l_rowCount);
+EXCEPTION
+   WHEN OTHERS THEN
+            DBMS_OUTPUT.PUT_LINE (g_insertStmt);
+           DBMS_OUTPUT.PUT_LINE('***error loading from external table');
+             
+           UPDATE_STATUS ('ERR_INSERT', NULL, SQLERRM);
+   END;
+
+
+   PROCEDURE UPDATE_STATUS (p_status         VARCHAR2,
+                            p_recordCount    NUMBER,
+                            p_logMessage     VARCHAR2)
+   AS
+   BEGIN
+         DBMS_OUTPUT.PUT_LINE('***update status file_id=' || g_fileID || ' ' || 'status=' || p_status);
+      CASE p_status
+           WHEN 'LOADING' THEN
+             UPDATE DWC_INPUT_FILE
+                SET STATUS = p_status, LOAD_START_DATE = SYSDATE, log_message = p_logMessage
+                  WHERE id = g_fileID;
+         WHEN 'LOADED' THEN
+            UPDATE DWC_INPUT_FILE
+               SET STATUS = p_status, 
+                      LOAD_FINISH_DATE = SYSDATE,
+                   RECORD_COUNT = p_recordCount,
+                   dur = (SYSDATE - LOAD_START_DATE) * 60 * 60 * 24,
+                   log_message = p_logMessage
+                    WHERE id = g_fileID;
+         ELSE
+             UPDATE DWC_INPUT_FILE SET STATUS = p_status, log_message = p_logMessage WHERE id = g_fileID;
+        END  CASE;            
+        COMMIT;
+        RETURN;
+   END;
+
+   PROCEDURE CREATE_EXT_TAB
+   AS
+      l_stmt clob;
+      l_cnt  number;
+   BEGIN
+      SELECT str_val INTO l_stmt
+        FROM dwc_str_repos
+       WHERE str_id = 'CREATE_EXT_' || upper(g_fileType);
+
+     
+      g_fileName := g_extTableName;
+      l_stmt := REPLACE (l_stmt, '#UNL_FILE_NAME#', g_fileName);
+      l_stmt := REPLACE (l_stmt, '#BAD_FILE#', replace(lower(g_extTableName), '$', ''));
+      l_stmt := REPLACE (l_stmt, '#LOG_FILE#', replace(lower(g_extTableName), '$', ''));
+      l_stmt := REPLACE (l_stmt, '#TABLE_NAME#', g_extTableName);
+        DBMS_OUTPUT.PUT_LINE(l_stmt);
+        EXECUTE IMMEDIATE l_stmt;
+
+EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+       RAISE_APPLICATION_ERROR (-20001, 'can not find create external table statement in dwc_str_repos');
+   WHEN OTHERS
+   THEN
+       DBMS_OUTPUT.PUT_LINE('***error create external table');
+      DBMS_OUTPUT.PUT_LINE(SQLERRM);
+      RAISE_APPLICATION_ERROR (-20002, 'error creating external table'); 
+   END;
+   
+   PROCEDURE ALTER_EXT_TAB
+   AS
+     l_stmt varchar2(1024);
+   BEGIN
+       DBMS_OUTPUT.PUT_LINE('altering external table');
+       l_stmt := 'alter table ' || g_extTableName || ' LOCATION (''' || g_fileName || ''')';
+       DBMS_OUTPUT.PUT_LINE(l_stmt);
+       execute immediate l_stmt;
+   END;                            
+
+    PROCEDURE BUILD_INSERT_STMT AS
+       l_stmt     clob;
+      l_nbrTransStmt clob;
+      l_start    number;
+      l_len        number;
+   BEGIN
+        DBMS_OUTPUT.PUT_LINE('part1');
+        select str_val into l_stmt from dwc_str_repos
+         where str_id = 'INSERT_STMT2';
+         DBMS_OUTPUT.PUT_LINE('part2');
+        l_stmt := replace(l_stmt, '#EXT_TAB_NAME#', g_extTableName);
+        
+DBMS_OUTPUT.PUT_LINE('part3');
+      g_insertStmt := l_stmt;
+                
+   EXCEPTION
+       WHEN NO_DATA_FOUND THEN
+          RAISE_APPLICATION_ERROR (-20003, 'can not find insert statement in dwc_str_repos');
+       WHEN OTHERS THEN
+          DBMS_OUTPUT.PUT_LINE('error building insert statement.');
+          RAISE_APPLICATION_ERROR (-20004, 'error creating insert statement');                        
+   END;
+     
+
+END PKG_ETL_UNL_FILES;
+/
